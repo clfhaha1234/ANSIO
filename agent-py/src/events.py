@@ -56,6 +56,21 @@ def _humanize(n: float) -> str:
     return str(n)
 
 
+def _intro(text: str, limit: int = 160) -> str:
+    """Concise creator/company blurb for the card body (博主/公司介绍): drop the
+    leading identity boilerplate ("Name (@h) is a ... posting in L." — already
+    shown as name+sub on the card) and clamp. Handles EN ". " and ZH "。"."""
+    t = (text or "").strip()
+    if not t:
+        return ""
+    for sep in (". ", "。"):
+        i = t.find(sep)
+        if 0 < i < 130:
+            t = t[i + len(sep):].strip()
+            break
+    return t[:limit].rstrip()
+
+
 def build_evidence(
     card_type: str,
     *,
@@ -176,5 +191,10 @@ def kol_items(docs: list[dict], limit: int = 6) -> list[dict]:
             sim = d.get("sim")
             if sim is not None:
                 item["sim"] = round(float(sim), 3)
+        # Creator intro/bio (博主介绍): from the doc profile text, minus the
+        # leading identity boilerplate, so the card shows "who is this creator".
+        intro = _intro(d.get("text"))
+        if intro:
+            item["desc"] = intro
         out.append(item)
     return out

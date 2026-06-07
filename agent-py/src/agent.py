@@ -360,6 +360,11 @@ class Assistant(Agent):
                 "name": r["metadata"].get("name", "?"),
                 "category": r["metadata"].get("category", ""),
                 "funding": r["metadata"].get("funding", ""),
+                "stage": r["metadata"].get("stage", ""),
+                # Company intro (公司介绍) from the product doc text + similarity,
+                # so the competitor card explains what each company actually is.
+                "desc": (r.get("text") or "")[:160],
+                "sim": r.get("sim"),
             }
             for r in rows
         ]
@@ -992,11 +997,7 @@ async def my_agent(ctx: JobContext):
             language_boost=tts_language_boost(language),
             emotion="neutral",
             speed=1.0,
-            # 16 kHz = one-third less audio data per second to synthesize/stream
-            # than 24 kHz, so MiniMax generation stays ahead of realtime playback
-            # and utterances FINISH instead of being flushed mid-sentence
-            # ("flush audio emitter due to slow audio generation").
-            sample_rate=16000,
+            sample_rate=24000,
         ),
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
@@ -1017,6 +1018,10 @@ async def my_agent(ctx: JobContext):
                     model=ai_coustics.EnhancerModel.QUAIL_VF_S
                 ),
             ),
+            # Text-FIRST captions (user requirement): publish the full reply
+            # transcript immediately instead of word-syncing it to audio, so
+            # the text is always on screen ahead of (and independent of) TTS.
+            text_output=room_io.TextOutputOptions(sync_transcription=False),
         ),
     )
 
