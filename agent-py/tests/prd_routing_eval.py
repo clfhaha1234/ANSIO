@@ -1,0 +1,258 @@
+"""PRD §4 routing eval — does the LLM call the RIGHT tool for each utterance?
+
+This validates the central PRD claim ("每一句话都触发一次真实检索") WITHOUT
+implementing the product. The 5 PRD tools are *stubs* that only record the call
+and return plausible canned data, so the only variable under test is the LLM's
+function-call routing given the PRD's tool descriptions + system prompt.
+
+Run (needs LIVEKIT_* for the Inference LLM; Moss not required — tools are stubbed):
+
+    ENV_FILE=../.env.local uv run python tests/prd_routing_eval.py
+    # or from the repo with creds:
+    uv run python tests/prd_routing_eval.py
+
+It drives a single multi-turn conversation through the PRD §4.1 main script plus
+a few §4.2 off-script turns, and prints, per turn, the EXPECTED tool vs the tool
+the LLM ACTUALLY called, with a final routing hit-rate.
+
+NOTE: routing is probabilistic. Treat the hit-rate as a signal, not a gate. The
+goal is to surface turns where the prompt/tool-descriptions mis-route, so the
+implementer can fix descriptions before building the real retrieval.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import textwrap
+
+import certifi
+
+os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+
+from dotenv import load_dotenv
+
+load_dotenv(os.getenv("ENV_FILE", ".env.local"))
+
+from livekit.agents import Agent, AgentSession, RunContext, function_tool, inference
+
+MODEL = "openai/gpt-4.1-mini"
+
+# Canned data so the multi-hop conversation can proceed coherently. The handles
+# match nothing real — routing, not retrieval, is under test.
+CANNED_COMPETITORS = (
+    "Cursor (AI code editor, $400M funding); GitHub Copilot (Microsoft); "
+    "Replit (cloud IDE, $250M); Codeium (free AI autocomplete)."
+)
+CANNED_PROMOTERS = (
+    "buildwithsam — 3 Cursor posts, 1.6M total views; "
+    "tldevtips — 2 posts, 740k views; aigrindexyz — 2 posts, 520k views."
+)
+CANNED_PROFILE = (
+    "buildwithsam: 220k subs on YouTube, audience 60% developers / 25% founders, "
+    "daily coding-workflow demos, 6.2% engagement, ~$1,800/video."
+)
+CANNED_SIMILAR = (
+    "20 similar dev creators incl. tldevtips (sim .91), shipfastleo (.88), "
+    "codewithana (.86), indiehacker_jo (.84)."
+)
+CANNED_PLAYBOOK = (
+    "Case: an AI dev tool ran 5 micro dev-creators, $4k budget -> 2,200 trials, "
+    "110 paid (source: internal_casebook_2024)."
+)
+
+
+class PRDAgent(Agent):
+    """Agent wired with the 5 PRD tools as call-recording stubs."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            llm=inference.LLM(model=MODEL),
+            instructions=textwrap.dedent(
+                """\
+                You are ANSIO, a voice-based growth advisor for startup founders.
+                A founder describes their product by voice; you find under-valued
+                KOLs (creators) for their campaign by SEARCHING as you talk.
+
+                Your loop is: Conversation -> Retrieval -> Reasoning -> Decision.
+                Almost every founder utterance should trigger exactly one tool
+                call. Pick the tool that fits the founder's CURRENT question:
+
+                - The founder describes their product / category, or asks "who are
+                  our competitors": call find_competitors.
+                - The founder asks who promoted / partnered with / worked with a
+                  specific brand (or asks what a specific @handle has promoted):
+                  call find_kols_who_promoted.
+                - You need one creator's audience / style / history before
+                  comparing them: call get_kol_profile.
+                - The founder asks for "more like them" / similar creators, or adds
+                  a platform/niche constraint to the candidate set: call
+                  find_similar_kols.
+                - The founder pushes back, asks "why", asks whether it's worth it,
+                  asks about ROI, or asks about content strategy/methodology: call
+                  search_playbook (it returns grounded cases and playbooks; never
+                  invent ROI or persuasion talking points).
+
+                Do NOT call a tool only when the founder changes a number you
+                already have (budget, weights) and just wants a re-rank, or makes
+                pure small talk.
+
+                Speak in one to three short, natural sentences (this is voice).
+                Never read JSON, lists, or tool names aloud.
+                """
+            ),
+        )
+        self.calls: list[tuple[str, dict]] = []
+
+    def _rec(self, name: str, **kw) -> None:
+        self.calls.append((name, kw))
+
+    @function_tool()
+    async def find_competitors(
+        self, context: RunContext, product_desc: str, top_k: int = 5
+    ) -> str:
+        """Find competitor products in the same category as the founder's product.
+
+        Call this first, as soon as the founder describes what they build, to map
+        the competitive landscape before looking at creators.
+
+        Args:
+            product_desc: Natural-language description of the founder's product.
+        """
+        self._rec("find_competitors", product_desc=product_desc, top_k=top_k)
+        return CANNED_COMPETITORS
+
+    @function_tool()
+    async def find_kols_who_promoted(
+        self, context: RunContext, brand: str, product_desc: str = ""
+    ) -> str:
+        """Find which creators have already promoted / partnered with a brand.
+
+        Use when the founder asks who a competitor works with, or (reverse) what a
+        specific creator handle has promoted.
+
+        Args:
+            brand: The brand name to look up (e.g. "cursor"). Lowercase it.
+            product_desc: Optional context to rank the most relevant content first.
+        """
+        self._rec("find_kols_who_promoted", brand=brand, product_desc=product_desc)
+        return CANNED_PROMOTERS
+
+    @function_tool()
+    async def get_kol_profile(self, context: RunContext, handle: str) -> str:
+        """Pull one creator's full profile (audience, style, history) by handle.
+
+        Use before comparing or recommending a specific creator.
+
+        Args:
+            handle: The creator handle, e.g. "buildwithsam" (no @).
+        """
+        self._rec("get_kol_profile", handle=handle)
+        return CANNED_PROFILE
+
+    @function_tool()
+    async def find_similar_kols(
+        self,
+        context: RunContext,
+        profile_text: str,
+        niche: str = "",
+        platform: str = "",
+        top_k: int = 20,
+    ) -> str:
+        """Find more creators similar to a profile, optionally constrained.
+
+        Use when the founder asks for "more like them" or adds a platform/niche
+        constraint.
+
+        Args:
+            profile_text: Description of the kind of creator to find more of.
+            niche: Optional category filter.
+            platform: Optional platform filter (e.g. YouTube).
+        """
+        self._rec(
+            "find_similar_kols",
+            profile_text=profile_text,
+            niche=niche,
+            platform=platform,
+            top_k=top_k,
+        )
+        return CANNED_SIMILAR
+
+    @function_tool()
+    async def search_playbook(
+        self, context: RunContext, question: str, doc_type: str = ""
+    ) -> str:
+        """Search grounded playbooks, strategy docs, and historical case studies.
+
+        Use for objections ("why bother?"), "why these creators?", content
+        strategy, and ROI questions — so answers cite real cases, not guesses.
+
+        Args:
+            question: What to look up.
+            doc_type: Optional one of qa / strategy / case.
+        """
+        self._rec("search_playbook", question=question, doc_type=doc_type)
+        return CANNED_PLAYBOOK
+
+
+# (utterance, expected_tool_or_None, note). None = expect NO tool call (re-rank/small talk).
+SCRIPT = [
+    ("We're building an AI coding tool and our growth has stalled.",
+     "find_competitors", "Step 1: product described -> landscape"),
+    ("Who are all of those competitors actually partnering with?",
+     "find_kols_who_promoted", "Step 2: who promoted"),
+    ("Cursor is way bigger than us — does benchmarking against them even make sense?",
+     "search_playbook", "Step 2b: objection -> grounded"),
+    ("Okay, break down who buildwithsam actually is.",
+     "get_kol_profile", "Step 3: pull profile"),
+    ("Are there others like them?",
+     "find_similar_kols", "Step 4: expand similar"),
+    ("Actually, only people on YouTube.",
+     "find_similar_kols", "Step 4b off-script: add platform constraint"),
+    ("Change the budget to five hundred dollars per video.",
+     None, "Off-script: pure re-rank, NO retrieval"),
+    ("Honestly is this even worth the spend?",
+     "search_playbook", "Step 8: ROI -> case"),
+    ("What has buildwithsam promoted before?",
+     "find_kols_who_promoted", "Off-script: reverse lookup by handle"),
+    ("Why these two creators specifically?",
+     "search_playbook", "Off-script: justify -> strategy doc"),
+]
+
+
+async def main() -> None:
+    print(f"PRD routing eval — LLM {MODEL}\n" + "=" * 78)
+    agent = PRDAgent()
+    hits = 0
+    scored = 0
+    async with AgentSession() as session:
+        await session.start(agent)
+        for i, (utt, expected, note) in enumerate(SCRIPT, 1):
+            before = len(agent.calls)
+            await session.run(user_input=utt)
+            fired = [c[0] for c in agent.calls[before:]]
+            actual = fired[0] if fired else None
+
+            scored += 1
+            ok = actual == expected
+            hits += int(ok)
+            mark = "✓" if ok else "✗"
+            exp = expected or "(no tool)"
+            act = " + ".join(fired) if fired else "(no tool)"
+            print(f"\n[{i}] {mark}  {note}")
+            print(f'    user: "{utt}"')
+            print(f"    expected: {exp:24s} actual: {act}")
+            if fired:
+                # show args of the first fired tool for inspection
+                args = agent.calls[before][1]
+                shown = {k: v for k, v in args.items() if v not in ("", 20, 5)}
+                print(f"    args: {shown}")
+
+    print("\n" + "=" * 78)
+    print(f"Routing hit-rate: {hits}/{scored}")
+    print("Note: routing is probabilistic — investigate ✗ rows; tune tool "
+          "descriptions/prompt, not the test.")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
