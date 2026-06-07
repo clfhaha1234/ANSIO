@@ -30,6 +30,9 @@ from livekit.agents import (
     inference,
     room_io,
 )
+from livekit.agents import (
+    tts as lk_tts,
+)
 from livekit.plugins import ai_coustics, minimax, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from moss import MossClient, QueryOptions
@@ -991,13 +994,20 @@ async def my_agent(ctx: JobContext):
         stt=inference.STT(model="deepgram/nova-3", language=stt_language(language)),
         # TTS: MiniMax professional growth-consultant voice (F3 selection).
         # voice overridable via ANSIO_TTS_VOICE if the team prefers another.
-        tts=minimax.TTS(
-            model="speech-2.8-turbo",
-            voice=os.getenv("ANSIO_TTS_VOICE", "English_Persuasive_Man"),
-            language_boost=tts_language_boost(language),
-            emotion="neutral",
-            speed=1.0,
-            sample_rate=24000,
+        # Sentence-by-sentence TTS (user-chosen): StreamAdapter tokenizes the
+        # reply into sentences and synthesizes EACH as its own complete request
+        # — one buffer per sentence, played atomically, cleared when done. A
+        # mid-utterance "slow generation" flush can therefore never truncate a
+        # sentence; the worst case is a brief pause BETWEEN sentences.
+        tts=lk_tts.StreamAdapter(
+            tts=minimax.TTS(
+                model="speech-2.8-turbo",
+                voice=os.getenv("ANSIO_TTS_VOICE", "English_Persuasive_Man"),
+                language_boost=tts_language_boost(language),
+                emotion="neutral",
+                speed=1.0,
+                sample_rate=24000,
+            ),
         ),
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
