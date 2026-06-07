@@ -13,6 +13,7 @@ dependencies = [
     "livekit-plugins-ai-coustics~=0.2",
     "python-dotenv",
     "moss>=1.4",
+    "livekit-plugins-minimax-ai>=1.5.16",
 ]
 
 [dependency-groups]
