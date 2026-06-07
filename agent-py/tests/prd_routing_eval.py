@@ -23,6 +23,7 @@ implementer can fix descriptions before building the real retrieval.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import textwrap
 
@@ -34,9 +35,39 @@ from dotenv import load_dotenv
 
 load_dotenv(os.getenv("ENV_FILE", ".env.local"))
 
-from livekit.agents import Agent, AgentSession, RunContext, function_tool, inference
+import sys
 
-MODEL = "openai/gpt-4.1-mini"
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+from livekit.agents import Agent, AgentSession, RunContext, function_tool
+
+from llm_factory import build_llm, model_label, resolve_provider
+
+# --- LLM selection (env-driven, via shared src/llm_factory.py) ----------------
+# Provider is one of: minimax | claude | inference. Override per run with the
+# EVAL_LLM_PROVIDER env var (falls back to LLM_PROVIDER, then "inference" here so
+# the historical baseline is the default when nothing is set).
+#
+#   # MiniMax-M2 (OpenAI-compatible):
+#   ENV_FILE=.env EVAL_LLM_PROVIDER=minimax uv run python tests/prd_routing_eval.py
+#   # Claude via the local sub2api 9090 relay:
+#   ENV_FILE=.env EVAL_LLM_PROVIDER=claude uv run python tests/prd_routing_eval.py
+#   # gpt-4.1-mini via LiveKit Inference (baseline):
+#   ENV_FILE=.env EVAL_LLM_PROVIDER=inference uv run python tests/prd_routing_eval.py
+#
+# Set TTFT_SAMPLES=N (default 5) to control how many TTFT samples are drawn.
+EVAL_LLM_PROVIDER = resolve_provider(
+    os.getenv("EVAL_LLM_PROVIDER") or os.getenv("LLM_PROVIDER") or "inference"
+)
+
+
+def build_eval_llm():
+    """Return an LLM for the eval via the shared factory, by EVAL_LLM_PROVIDER."""
+    return build_llm(EVAL_LLM_PROVIDER)
+
+
+# Human-readable label for the header / output, no secrets.
+MODEL = model_label(EVAL_LLM_PROVIDER)
 
 # Canned data so the multi-hop conversation can proceed coherently. The handles
 # match nothing real — routing, not retrieval, is under test.
@@ -67,7 +98,7 @@ class PRDAgent(Agent):
 
     def __init__(self) -> None:
         super().__init__(
-            llm=inference.LLM(model=MODEL),
+            llm=build_eval_llm(),
             instructions=textwrap.dedent(
                 """\
                 You are ANSIO, a voice-based growth advisor for startup founders.
@@ -220,8 +251,69 @@ SCRIPT = [
 ]
 
 
+async def sample_ttft(n: int) -> dict:
+    """Measure time-to-first-token over `n` cold-ish calls for EVAL_LLM_PROVIDER.
+
+    TTFT = wall time from `llm.chat(...)` to the first streamed chunk. We use a
+    realistic system prompt + the 5 PRD tool schemas as context so the number
+    reflects the demo's true first-token cost (tool-call prompts are heavier than
+    a bare chat). Returns mean / p95 (ms) plus the raw samples. Failures are
+    surfaced rather than swallowed so a dead relay is obvious.
+    """
+    import statistics
+    import time
+
+    from livekit.agents.llm import ChatContext
+
+    llm = build_eval_llm()
+    # Reuse the PRD agent's tools so the prompt weight matches the routing eval.
+    tools = list(PRDAgent().tools) if hasattr(PRDAgent(), "tools") else None
+
+    samples: list[float] = []
+    errors: list[str] = []
+    for _ in range(n):
+        ctx = ChatContext.empty()
+        ctx.add_message(
+            role="system",
+            content=(
+                "You are ANSIO, a voice growth advisor. Reply in one short "
+                "natural sentence; call a tool only when warranted."
+            ),
+        )
+        ctx.add_message(
+            role="user",
+            content="We're building an AI coding tool and growth has stalled.",
+        )
+        t0 = time.perf_counter()
+        stream = llm.chat(chat_ctx=ctx, tools=tools) if tools else llm.chat(chat_ctx=ctx)
+        first: float | None = None
+        try:
+            async for _chunk in stream:
+                if first is None:
+                    first = (time.perf_counter() - t0) * 1000.0
+                    break  # TTFT only — stop after the first token
+        except Exception as exc:  # noqa: BLE001 — surface relay/auth failures
+            errors.append(f"{type(exc).__name__}: {str(exc)[:120]}")
+        finally:
+            with contextlib.suppress(Exception):
+                await stream.aclose()
+        if first is not None:
+            samples.append(first)
+
+    out = {"samples": samples, "errors": errors}
+    if samples:
+        ordered = sorted(samples)
+        out["mean"] = statistics.mean(samples)
+        # p95 via nearest-rank (small-n safe).
+        idx = max(0, min(len(ordered) - 1, round(0.95 * len(ordered) + 0.5) - 1))
+        out["p95"] = ordered[idx]
+        out["min"] = ordered[0]
+        out["max"] = ordered[-1]
+    return out
+
+
 async def main() -> None:
-    print(f"PRD routing eval — LLM {MODEL}\n" + "=" * 78)
+    print(f"PRD routing eval — provider={EVAL_LLM_PROVIDER} LLM {MODEL}\n" + "=" * 78)
     agent = PRDAgent()
     hits = 0
     scored = 0
@@ -252,6 +344,24 @@ async def main() -> None:
     print(f"Routing hit-rate: {hits}/{scored}")
     print("Note: routing is probabilistic — investigate ✗ rows; tune tool "
           "descriptions/prompt, not the test.")
+
+    # --- TTFT sampling (n>=5 by default) --------------------------------------
+    n = int(os.getenv("TTFT_SAMPLES", "5"))
+    print("\n" + "=" * 78)
+    print(f"TTFT sampling — provider={EVAL_LLM_PROVIDER} LLM {MODEL} (n={n})")
+    stats = await sample_ttft(n)
+    if stats.get("errors"):
+        for e in stats["errors"][:3]:
+            print(f"    ttft error: {e}")
+    if stats.get("samples"):
+        s = stats["samples"]
+        print("    samples(ms): " + ", ".join(f"{x:.0f}" for x in s))
+        print(
+            f"    TTFT mean={stats['mean']:.0f}ms  p95={stats['p95']:.0f}ms  "
+            f"min={stats['min']:.0f}ms  max={stats['max']:.0f}ms  ok={len(s)}/{n}"
+        )
+    else:
+        print("    TTFT: no successful samples (provider unreachable?).")
 
 
 if __name__ == "__main__":

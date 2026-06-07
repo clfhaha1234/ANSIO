@@ -1,3 +1,4 @@
+import { MemoryToggle } from '@/components/app/memory-toggle';
 import { Button } from '@/components/ui/button';
 
 function WelcomeImage() {
@@ -44,6 +45,8 @@ export const WelcomeView = ({
         >
           {startButtonText}
         </Button>
+
+        <MemoryToggle className="mt-4 flex items-center justify-center gap-2" />
       </section>
 
       <div className="fixed bottom-5 left-0 flex w-full items-center justify-center">

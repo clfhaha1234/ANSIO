@@ -14,6 +14,9 @@ dependencies = [
     "python-dotenv",
     "moss>=1.4",
     "livekit-plugins-minimax-ai>=1.5.16",
+    "livekit-plugins-openai>=1.5.16",
+    "fastapi",
+    "uvicorn[standard]",
 ]
 
 [dependency-groups]

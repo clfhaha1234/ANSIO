@@ -7,6 +7,7 @@ import { WarningIcon } from '@phosphor-icons/react/dist/ssr';
 import type { AppConfig } from '@/app-config';
 import { AgentSessionProvider } from '@/components/agents-ui/agent-session-provider';
 import { StartAudioButton } from '@/components/agents-ui/start-audio-button';
+import { consumeRefreshProfile, readMemoryEnabled } from '@/components/app/memory-toggle';
 import { ViewController } from '@/components/app/view-controller';
 import { Toaster } from '@/components/ui/sonner';
 import { useAgentErrors } from '@/hooks/useAgentErrors';
@@ -28,9 +29,28 @@ interface AppProps {
 
 export function App({ appConfig }: AppProps) {
   const tokenSource = useMemo(() => {
-    return typeof process.env.NEXT_PUBLIC_CONN_DETAILS_ENDPOINT === 'string'
-      ? getSandboxTokenSource(appConfig)
-      : TokenSource.endpoint('/api/token');
+    if (typeof process.env.NEXT_PUBLIC_CONN_DETAILS_ENDPOINT === 'string') {
+      return getSandboxTokenSource(appConfig);
+    }
+
+    // Custom source so we can attach the user's memory preferences to the token request.
+    // `refresh_profile` is read-and-cleared (one-shot) so a scheduled reset fires only once.
+    const roomConfig = appConfig.agentName
+      ? { agents: [{ agent_name: appConfig.agentName }] }
+      : undefined;
+
+    return TokenSource.custom(async () => {
+      const res = await fetch('/api/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          room_config: roomConfig,
+          memory_enabled: readMemoryEnabled(),
+          refresh_profile: consumeRefreshProfile(),
+        }),
+      });
+      return await res.json();
+    });
   }, [appConfig]);
 
   const session = useSession(

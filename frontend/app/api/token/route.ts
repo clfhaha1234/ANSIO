@@ -64,7 +64,11 @@ export async function POST(req: Request) {
     if (roomConfig.agents.length === 0) {
       roomConfig.agents.push(new RoomAgentDispatch({ agentName: AGENT_NAME ?? '' }));
     }
-    const dispatchMetadata = JSON.stringify({ user_id: userId });
+    const dispatchMetadata = JSON.stringify({
+      user_id: userId,
+      memory_enabled: !!body?.memory_enabled,
+      refresh_profile: !!body?.refresh_profile,
+    });
     for (const agent of roomConfig.agents) {
       if (!agent.agentName && AGENT_NAME) {
         agent.agentName = AGENT_NAME;

@@ -11,6 +11,9 @@ KMS
 .pytest_cache
 .ruff_cache
 
+# Generated TTS audition samples (regenerate with tools/tts_audition.py)
+tts_samples/
+
 # Claude Code
 .claude/settings.local.json
 .claude/worktrees/
@@ -31,3 +34,10 @@ KMS
 
 # GitHub CLI
 .github/personal-instructions.md
+
+# Precomputed Claude quality scores — generated handoff artifact, never committed
+# (regenerate with src/precompute_scores.py)
+kol_quality_scores.json
+
+# Real per-KOL pricing (xlsx-derived) must NEVER be committed (v4 red line)
+curated_real.json
