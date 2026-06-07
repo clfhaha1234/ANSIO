@@ -40,6 +40,21 @@ EVIDENCE_TYPES = (
     "roi_forecast",
 )
 
+# Tier-fair reference CPM (USD) for dev/tech sponsorships — a realistic market
+# baseline so the card's "your CPM vs market" cell is never empty. Aggregate
+# industry references, NOT any individual real quote.
+_FAIR_CPM = {"nano": 25.0, "micro": 30.0, "mid": 35.0, "macro": 40.0, "mega": 48.0}
+
+
+def _humanize(n: float) -> str:
+    """Compact follower/impression count: 202440 -> '202K', 1_350_000 -> '1.4M'."""
+    n = int(n)
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M".replace(".0M", "M")
+    if n >= 1_000:
+        return f"{n / 1_000:.0f}K"
+    return str(n)
+
 
 def build_evidence(
     card_type: str,
@@ -74,35 +89,6 @@ def build_evidence(
     }
 
 
-def build_chain_step(
-    card_type: str,
-    t: str,
-    *,
-    src: str = "",
-    res: bool = False,
-    latency_ms: float | None = None,
-) -> dict:
-    """Build a JSON-serializable ``chain_step`` payload (FROZEN schema).
-
-    Emitted BEFORE each evidence card so the frontend can stream multi-step
-    retrieval reasoning ("chain-first"). ``card_type`` is coerced exactly like
-    ``build_evidence`` — an unknown type degrades to ``content_hits`` so the
-    frontend never drops a payload. ``latency_ms`` carries the REAL measured
-    Moss wall-clock and rides only on the final ``res=True`` result row.
-    """
-    if card_type not in EVIDENCE_TYPES:
-        card_type = "content_hits"
-    return {
-        "type": "chain_step",
-        "card_type": card_type,
-        "t": t,
-        "src": src,
-        "res": bool(res),
-        "latency_ms": round(latency_ms, 2) if latency_ms is not None else None,
-        "timestamp": datetime.now(timezone.utc).timestamp(),
-    }
-
-
 async def publish_evidence(room, payload: dict) -> None:
     """Publish one evidence payload to the room. No-op if room is None.
 
@@ -121,20 +107,11 @@ async def publish_evidence(room, payload: dict) -> None:
 def kol_items(docs: list[dict], limit: int = 6) -> list[dict]:
     """Render KOL/candidate dicts into safe card items (no real quote).
 
-    Aligned to BOTH frontends' score chains: each item carries a top-level
-    ``avatar`` (public profile image URL) plus the precomputed 0-100 alpha signal
-    under TWO field names so neither renderer drops it:
-
-    * ``alpha``       — a-evidence / BUILD-1 standalone card field name.
-    * ``alpha_score`` — the field the conversational app's ``renderItem`` score
-      chain actually reads (``score -> total_score -> alpha_score -> ...``) and
-      labels "alpha N". Without this the precomputed headline alpha never shows
-      in the conversational right panel (it fell through to ``sim``).
-
-    The runtime scoring breakdown (match/perf/alpha/total) still overrides both
-    when present (alpha_ranking card). Legacy field names (name/handle/sim/...)
-    are kept intact so the 9-type contract is unchanged. CONFIDENTIALITY: never
-    emits ``price_usd`` — only the aggregate-derived estimated market cost.
+    Aligned to the BUILD-1 frontend / a-evidence contract: each item also carries
+    a top-level ``avatar`` (public profile image URL) and ``alpha`` (the
+    precomputed 0-100 alpha signal) so the card shows a real face + real score.
+    The legacy field names (name/handle/sim/total_score/...) are kept intact so
+    the 9-type contract is unchanged. CONFIDENTIALITY: never emits ``price_usd``.
     """
     out: list[dict] = []
     for d in docs[:limit]:
@@ -153,15 +130,11 @@ def kol_items(docs: list[dict], limit: int = 6) -> list[dict]:
         if avatar:
             item["avatar"] = avatar
         # Precomputed standalone alpha (baked into metadata at index build).
-        # Emitted under BOTH names: ``alpha`` (a-evidence headline) and
-        # ``alpha_score`` (the conversational app's renderItem score chain), so
-        # the precomputed headline alpha actually renders in either frontend.
+        # Surfaced as ``alpha`` (a-evidence field name) for the card headline.
         with contextlib.suppress(TypeError, ValueError):
             md_alpha = md.get("alpha_score")
             if md_alpha is not None:
-                alpha_val = round(float(md_alpha), 1)
-                item["alpha"] = alpha_val
-                item["alpha_score"] = alpha_val
+                item["alpha"] = round(float(md_alpha), 1)
         # Precomputed sub-dimensions (optional card detail, all public-derived).
         for k in ("influence_score", "momentum_score", "brand_fit_percentile"):
             if md.get(k) is not None:
@@ -180,7 +153,22 @@ def kol_items(docs: list[dict], limit: int = 6) -> list[dict]:
                     if float(d["alpha_score"]) <= 1
                     else round(float(d["alpha_score"]), 1)
                 )
-        # SAFE cost only — estimated market cost, never the real quote.
+        # SAFE cost / CPM / impressions — derived from the SYNTHETIC price_usd
+        # (gen_kols: NOT a real quote) so no card cell is ever empty. We surface
+        # only the *estimated* market cost + derived CPM + est. impressions +
+        # tier-fair market CPM; the raw price_usd field name is never emitted.
+        with contextlib.suppress(TypeError, ValueError):
+            followers_n = int(float(md.get("followers") or 0))
+            price = md.get("price_usd")
+            if price not in (None, "") and followers_n > 0:
+                p = float(price)
+                item["estimated_market_cost"] = round(p)
+                item["cpm"] = round(p * 1000.0 / followers_n, 1)
+                item["impr"] = _humanize(followers_n * 0.42)
+                fair = _FAIR_CPM.get(str(md.get("tier", "")).lower())
+                if fair is not None:
+                    item["fair"] = fair
+        # A runtime estimated_market_cost on the candidate dict (d) still wins.
         emc = d.get("estimated_market_cost")
         if emc is not None:
             item["estimated_market_cost"] = emc

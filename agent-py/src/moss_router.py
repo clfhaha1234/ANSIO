@@ -138,32 +138,48 @@ class MossRouter:
         self._cloud = cloud
         self._kols = kols_index
 
+    def __getattr__(self, name):
+        # Full drop-in transparency: anything the router doesn't override
+        # (incl. test-fake attributes like ``results_by_index``) delegates to
+        # the wrapped cloud client. Only fires for attributes not found here.
+        return getattr(self._cloud, name)
+
     # -- loading -----------------------------------------------------------
-    # NEVER awaits the local build (measured ~2-3 min for the current
-    # kols.json): on_enter must not hang a fresh call. The daemon thread keeps
-    # building; queries before readiness fail fast into the tools' existing
-    # degrade paths and recover automatically once the index is up.
+    # CLOUD-FIRST: the healthy path is the cloud index (teammate's project).
+    # Only when the cloud KOL index fails (missing index / quota outage) does
+    # the router arm the local on-device session as a zero-quota fallback.
+    # The local build never blocks (daemon thread); queries during the build
+    # window fail fast into the tools' existing degrade paths.
     async def load_index(self, name: str):
-        if name == self._kols:
+        try:
+            return await self._cloud.load_index(name)
+        except Exception:
+            if name != self._kols:
+                raise
+            logger.warning("cloud load failed for %s; arming local fallback", name)
             prewarm_session(name)
-            return
-        return await self._cloud.load_index(name)
 
     async def load_indexes(self, names: list[str]):
-        cloud_names = [n for n in names if n != self._kols]
-        if cloud_names:
-            await self._cloud.load_indexes(cloud_names)
-        if self._kols in names:
-            prewarm_session(self._kols)
+        try:
+            return await self._cloud.load_indexes(names)
+        except Exception:
+            # Per-index retry so one bad index doesn't block the rest; the KOL
+            # index additionally arms its local fallback.
+            for n in names:
+                with contextlib.suppress(Exception):
+                    await self.load_index(n)
 
     # -- query -------------------------------------------------------------
     async def query(self, name: str, text: str, options=None):
-        if name == self._kols:
-            if _session is None:  # still warming -> fast-fail to degrade paths
-                prewarm_session(name)
-                raise RuntimeError("local KOL index still warming up")
+        if name != self._kols:
+            return await self._cloud.query(name, text, options)
+        try:
+            return await self._cloud.query(name, text, options)
+        except Exception:
+            if _session is None:
+                prewarm_session(name)  # arm fallback; fail fast this turn
+                raise
             return await _session.query(text, _localize_filter(options))
-        return await self._cloud.query(name, text, options)
 
     # -- passthrough mutations (memory profiles live in ansio_content) ------
     async def add_docs(self, name: str, docs, options=None):

@@ -1,59 +1,69 @@
-"""Offline unit tests for the events payload builders.
+"""Offline unit tests for the events payload builders (no Moss/LiveKit/network).
 
-These import ``events`` directly (no Moss, no LiveKit, no network) and assert the
-FROZEN ``chain_step`` schema the frontend streams as multi-step reasoning before
-each evidence card. Mirrors the stub-only style of ``tests/test_tools.py``.
+The old chain_step schema was retired by the 8-step orchestration refactor
+(cards now carry their own ``step``); these tests pin the surviving contract,
+most importantly the CONFIDENTIALITY red line: ``kol_items`` must NEVER emit a
+raw ``price_usd`` — only the aggregate-derived ``estimated_market_cost``.
 """
 
 from __future__ import annotations
 
-from events import EVIDENCE_TYPES, build_chain_step
+from events import EVIDENCE_TYPES, build_evidence, kol_items
 
-# --- shape (FROZEN schema) --------------------------------------------------
-
-
-def test_build_chain_step_minimal_shape():
-    step = build_chain_step("alpha_ranking", "Scanning for underpriced creators")
-    assert step["type"] == "chain_step"
-    assert step["card_type"] == "alpha_ranking"
-    assert step["t"] == "Scanning for underpriced creators"
-    assert step["src"] == ""
-    assert step["res"] is False
-    assert step["latency_ms"] is None
-    assert isinstance(step["timestamp"], float)
-    # Exactly the frozen keys, nothing extra.
-    assert set(step) == {"type", "card_type", "t", "src", "res", "latency_ms",
-                         "timestamp"}
+# --- build_evidence (frozen card contract) -----------------------------------
 
 
-def test_build_chain_step_result_row_carries_latency():
-    step = build_chain_step(
-        "similar_creators", "80 candidates recalled",
-        src="ansio_kols", res=True, latency_ms=8.3456,
-    )
-    assert step["res"] is True
-    assert step["src"] == "ansio_kols"
-    assert step["latency_ms"] == 8.35  # rounded to 2 dp like build_evidence
+def test_build_evidence_minimal_shape():
+    card = build_evidence("alpha_ranking", step=5, latency_ms=8.3456)
+    assert card["type"] == "alpha_ranking"
+    assert card["card_type"] == "alpha_ranking"
+    assert card["step"] == 5
+    assert card["latency_ms"] == 8.35  # rounded to 2 dp
+    assert card["items"] == []
+    assert isinstance(card["timestamp"], float)
 
 
-# --- unknown card_type coercion (parity with build_evidence) ----------------
+def test_build_evidence_unknown_type_coerces_to_content_hits():
+    assert build_evidence("not_a_real_card")["type"] == "content_hits"
 
 
-def test_build_chain_step_unknown_type_coerces_to_content_hits():
-    step = build_chain_step("not_a_real_card", "querying")
-    assert step["card_type"] == "content_hits"
-
-
-def test_build_chain_step_all_known_types_pass_through():
+def test_build_evidence_all_known_types_pass_through():
     for ct in EVIDENCE_TYPES:
-        assert build_chain_step(ct, "step")["card_type"] == ct
+        assert build_evidence(ct)["type"] == ct
 
 
-# --- res is always coerced to a real bool -----------------------------------
+# --- kol_items confidentiality red line ---------------------------------------
 
 
-def test_build_chain_step_res_is_coerced_to_bool():
-    truthy = build_chain_step("kol_profile", "loaded", res=1)
-    falsy = build_chain_step("kol_profile", "loading", res=0)
-    assert truthy["res"] is True
-    assert falsy["res"] is False
+def _doc(**md):
+    return {"metadata": md}
+
+
+def test_kol_items_never_emits_raw_price_usd():
+    items = kol_items([
+        _doc(name="Example KOL", handle="examplekol", followers="10000",
+             price_usd="1234", tier="micro"),
+    ])
+    assert len(items) == 1
+    item = items[0]
+    assert "price_usd" not in item, "raw per-KOL price must never leave the agent"
+    # The sanctioned public form is the derived estimate.
+    assert item.get("estimated_market_cost") == 1234
+
+
+def test_kol_items_survives_missing_price_and_followers():
+    items = kol_items([_doc(name="No Price", handle="noprice")])
+    assert items[0]["name"] == "No Price"
+    assert "price_usd" not in items[0]
+
+
+def test_kol_items_passes_public_fields_and_avatar():
+    items = kol_items([
+        _doc(name="Avatar KOL", handle="avatarkol", platform="YouTube",
+             followers="5000", niche="tech", engagement_pct="6.1",
+             avatar_url="https://example.com/a.png"),
+    ])
+    item = items[0]
+    assert item["platform"] == "YouTube"
+    assert item["niche"] == "tech"
+    assert item.get("avatar") == "https://example.com/a.png"

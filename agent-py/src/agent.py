@@ -34,7 +34,7 @@ from livekit.plugins import ai_coustics, minimax, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from moss import MossClient, QueryOptions
 
-from events import build_chain_step, build_evidence, kol_items, publish_evidence
+from events import EVIDENCE_TYPES, build_evidence, kol_items, publish_evidence
 from lang import (
     greeting_suffix,
     language_directive,
@@ -49,6 +49,7 @@ from memory import (
     memory_greeting,
     profile_instructions,
 )
+from moss_router import MossRouter
 from scoring import load_benchmark, score_and_rank
 from state import AnsioState
 
@@ -145,12 +146,6 @@ def _md_list(result) -> list[dict]:
     return out
 
 
-def _short(text: str, limit: int = 28) -> str:
-    """Clamp a query string for judge-readable chain-step labels (≤60 chars)."""
-    t = (text or "").strip()
-    return t if len(t) <= limit else t[: limit - 1].rstrip() + "…"
-
-
 def _to_int(v) -> int:
     try:
         return int(float(v))
@@ -161,6 +156,62 @@ def _to_int(v) -> int:
 def _fmt_int(v) -> str:
     n = _to_int(v)
     return f"{n:,}" if n else str(v if v is not None else "?")
+
+
+def _looks_like_retrieval_turn(text: str) -> bool:
+    """Cheap guard for pre-retrieval: search only when the turn has demo intent."""
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    smalltalk = {
+        "hi", "hello", "hey", "thanks", "thank you", "ok", "okay", "好的",
+        "谢谢", "你好", "您好", "明白", "可以", "没问题",
+    }
+    if t in smalltalk:
+        return False
+    retrieval_markers = (
+        "ai coding", "coding tool", "developer", "indie hacker", "builder",
+        "creator", "kol", "influencer", "campaign", "growth", "user growth",
+        "competitor", "cursor", "copilot", "replit", "codeium", "youtube",
+        "twitter", "x ", "audience", "budget", "roi", "达人", "创作者",
+        "增长", "用户", "竞品", "对标", "投放", "营销", "开发者", "独立开发者",
+        "预算", "转化", "合作", "报价",
+    )
+    return any(marker in t for marker in retrieval_markers)
+
+
+def _llm_card_items(items_json: str, limit: int = 6) -> list[dict]:
+    """Parse and sanitize LLM-authored card items before they hit the UI."""
+    if not items_json:
+        return []
+    try:
+        raw = json.loads(items_json)
+    except json.JSONDecodeError:
+        return []
+    if isinstance(raw, dict):
+        raw = raw.get("items", [])
+    if not isinstance(raw, list):
+        return []
+
+    allowed = {
+        "title", "name", "handle", "platform", "followers", "niche", "region",
+        "sub", "source", "reason", "why", "takeaway", "score", "alpha", "match_score",
+        "perf_score", "total_score", "engagement_pct", "estimated_market_cost",
+        "posts", "total_views",
+    }
+    out: list[dict] = []
+    for item in raw[:limit]:
+        if not isinstance(item, dict):
+            continue
+        clean = {}
+        for key, value in item.items():
+            if key not in allowed or value is None:
+                continue
+            if isinstance(value, (str, int, float, bool)):
+                clean[key] = str(value)[:220] if isinstance(value, str) else value
+        if clean:
+            out.append(clean)
+    return out
 
 
 # ===========================================================================
@@ -183,11 +234,11 @@ class Assistant(Agent):
     ) -> None:
         super().__init__(
             # The conversational brain comes from the LLM factory (default
-            # provider=minimax per F2's measured verdict; claude/inference are
-            # env-hot-swap fallbacks). build_llm() lazily imports its plugin.
+            # provider=inference / openai/gpt-4.1-mini; minimax and claude are
+            # env-hot-swap alternatives). build_llm() lazily imports its plugin.
             llm=build_llm(),
             # A consented user profile (memory.py) and the language rule
-            # (lang.py) ride in as system suffixes.
+            # (lang.py) ride in as system suffixes on the 8-step story prompt.
             instructions=(
                 _INSTRUCTIONS
                 + profile_instructions(profile)
@@ -196,16 +247,17 @@ class Assistant(Agent):
         )
         self._room = room
         self._user_id = user_id
-        # All three indexes are served from the cloud Moss project (ansio_kols
-        # rebuilt lean on a fresh-quota project — build_indexes --lean). A plain
-        # cloud client keeps each job process light: no on-device embedding, no
-        # 3GB local SessionIndex. moss_router.py stays as a zero-quota fallback.
-        self._moss = MossClient(
-            os.getenv("MOSS_PROJECT_ID"), os.getenv("MOSS_PROJECT_KEY")
+        # KOL traffic can route to a local Moss session index when the cloud
+        # project is unavailable (see moss_router.py); content/products stay
+        # on the cloud client unchanged.
+        self._moss = MossRouter(
+            MossClient(os.getenv("MOSS_PROJECT_ID"), os.getenv("MOSS_PROJECT_KEY")),
+            IDX_KOLS,
         )
         self._indexes_loaded = False
         self._benchmark = load_benchmark()
         self._state = AnsioState()
+        self._turn_card_types: set[str] = set()
         # Dedup guard for on_user_turn_completed double-fire under preemptive
         # generation (livekit/agents #3414): remember the last injected turn.
         self._last_injected_text = None
@@ -241,28 +293,14 @@ class Assistant(Agent):
         if not text or text == self._last_injected_text:
             return  # same-turn dedup guard (preemptive double-fire)
         self._last_injected_text = text
+        self._turn_card_types.clear()
+        if not _looks_like_retrieval_turn(text):
+            return
         try:
-            await publish_evidence(
-                self._room,
-                build_chain_step(
-                    "similar_creators",
-                    f"Reading the brief — '{_short(text)}'",
-                ),
-            )
-            t0 = time.perf_counter()
             result = await self._moss.query(IDX_KOLS, text, QueryOptions(top_k=3))
-            took_ms = (time.perf_counter() - t0) * 1000.0
             cands = _md_list(result)
             if not cands:
                 return
-            await publish_evidence(
-                self._room,
-                build_chain_step(
-                    "similar_creators",
-                    f"{len(cands)} candidates surfaced",
-                    src=IDX_KOLS, res=True, latency_ms=took_ms,
-                ),
-            )
             snippet = "; ".join(
                 f"{c['metadata'].get('name', '?')} (@{c['metadata'].get('handle', '?')})"
                 for c in cands[:3]
@@ -274,16 +312,9 @@ class Assistant(Agent):
                     f"verbatim] candidates near this brief: {snippet}"
                 ),
             )
-            await publish_evidence(
-                self._room,
-                build_evidence(
-                    "similar_creators",
-                    index=IDX_KOLS,
-                    latency_ms=took_ms,
-                    items=kol_items(cands, limit=3),
-                    insight="Pre-retrieved candidates for the latest turn.",
-                ),
-            )
+            # Keep pre-retrieval invisible: it is context for lower latency, not a
+            # right-rail demo step. Visible cards should advance only when the
+            # LLM/tool route intentionally selects that step.
         except Exception:
             logger.exception("Preemptive retrieval injection failed")
 
@@ -307,20 +338,17 @@ class Assistant(Agent):
     async def find_competitors(
         self, context: RunContext, product_desc: str, top_k: int = 5
     ) -> str:
-        """Find competing products/brands in the user's space (semantic only).
+        """STEP 1 — Competitor Discovery.
+
+        Use after a new product/growth brief, especially for "AI coding tool",
+        "who should we benchmark", or "what companies already ran this motion".
+        This should drive a right-rail "Competitor Landscape" card.
 
         Args:
             product_desc: Natural-language description of the user's product,
                 e.g. "an AI pair-programming tool for backend engineers".
             top_k: How many competitors to return (default 5).
         """
-        await publish_evidence(
-            self._room,
-            build_chain_step(
-                "competitor_landscape",
-                f"Mapping your space — '{_short(product_desc)}'",
-            ),
-        )
         try:
             result, ms = await self._q(IDX_PRODUCTS, product_desc, top_k=top_k)
         except Exception:
@@ -335,14 +363,6 @@ class Assistant(Agent):
             }
             for r in rows
         ]
-        await publish_evidence(
-            self._room,
-            build_chain_step(
-                "competitor_landscape",
-                f"{len(items)} close competitors found",
-                src=IDX_PRODUCTS, res=True, latency_ms=ms,
-            ),
-        )
         await publish_evidence(
             self._room,
             build_evidence(
@@ -365,7 +385,11 @@ class Assistant(Agent):
         kol_handle: str = "",
         product_desc: str = "",
     ) -> str:
-        """Find sponsorship history. Two MUTUALLY EXCLUSIVE directions (PRD T4):
+        """STEP 2 — Competitor Campaign / Partnership Analysis.
+
+        Use when the founder asks who a competitor worked with, what Cursor or
+        Codeium did on Twitter/YouTube, or which creator campaigns performed.
+        Two MUTUALLY EXCLUSIVE directions:
 
         - Forward "who promoted BRAND": pass ``brand`` only.
         - Reverse "what has @HANDLE promoted": pass ``kol_handle`` only.
@@ -385,13 +409,6 @@ class Assistant(Agent):
             qtext = product_desc or f"{brand_n} sponsored review"
         else:
             return "Tell me a brand to look up, or a creator handle to reverse-lookup."
-        intent = (
-            f"Tracing who promoted {brand_n}" if brand_n
-            else f"Tracing what @{handle_n} promoted"
-        )
-        await publish_evidence(
-            self._room, build_chain_step("content_hits", _short(intent, 56)),
-        )
         try:
             result, ms = await self._q(IDX_CONTENT, qtext, top_k=50, filt=filt)
         except Exception:
@@ -412,14 +429,6 @@ class Assistant(Agent):
         top = sorted(agg.values(), key=lambda e: e["total_views"], reverse=True)[:10]
         await publish_evidence(
             self._room,
-            build_chain_step(
-                "content_hits",
-                f"{len(top)} creators with sponsorship history",
-                src=IDX_CONTENT, res=True, latency_ms=ms,
-            ),
-        )
-        await publish_evidence(
-            self._room,
             build_evidence(
                 "content_hits", step=2, index=IDX_CONTENT, latency_ms=ms,
                 items=top, insight=f"{len(top)} creators with sponsorship history.",
@@ -434,7 +443,10 @@ class Assistant(Agent):
 
     @function_tool()
     async def get_kol_profile(self, context: RunContext, handle: str) -> str:
-        """Pull one creator's full profile by handle (point lookup, PRD T3).
+        """STEP 4 — Creator / Audience Intelligence for one creator.
+
+        Use when the founder asks why a specific creator is good, wants audience
+        fit, content style, engagement, region, or performance details.
 
         Args:
             handle: The creator handle, with or without a leading @.
@@ -443,10 +455,6 @@ class Assistant(Agent):
         if not h:
             return "I need a creator handle to look up."
         filt = {"field": "handle", "condition": {"$eq": h}}
-        await publish_evidence(
-            self._room,
-            build_chain_step("kol_profile", f"Pulling profile for @{_short(h, 40)}"),
-        )
         try:
             result, ms = await self._q(IDX_KOLS, h, top_k=1, filt=filt)
         except Exception:
@@ -457,14 +465,6 @@ class Assistant(Agent):
             return f"I don't have a profile for {h}."
         r = rows[0]
         md = r["metadata"]
-        await publish_evidence(
-            self._room,
-            build_chain_step(
-                "kol_profile",
-                f"Profile loaded — {_short(md.get('name', h), 30)}",
-                src=IDX_KOLS, res=True, latency_ms=ms,
-            ),
-        )
         await publish_evidence(
             self._room,
             build_evidence(
@@ -488,7 +488,10 @@ class Assistant(Agent):
         platform: str = "",
         top_k: int = WIDE_POOL_TOP_K,
     ) -> str:
-        """Find creators similar to a brief; recalls a WIDE pool (PRD T1, T2).
+        """STEP 3/4 — Creator Discovery and Similar Creator Expansion.
+
+        Use when the founder asks what kind of creators to find, asks for people
+        similar to Cursor's partners, or changes platform/niche/audience filters.
 
         Recalls ``top_k=80`` WITHOUT a budget filter and caches the pool so
         budget/weight changes re-rank in Python with no re-query. Re-call this
@@ -503,13 +506,6 @@ class Assistant(Agent):
         platform_w = _wl_platform(platform)
         niche_w = _wl_niche(niche)
         filt = _build_kol_filter(platform_w, niche_w)
-        await publish_evidence(
-            self._room,
-            build_chain_step(
-                "similar_creators",
-                f"Matching audience to your ICP — '{_short(profile_text)}'",
-            ),
-        )
         try:
             result, ms = await self._q(IDX_KOLS, profile_text, top_k=top_k, filt=filt)
         except Exception:
@@ -522,20 +518,25 @@ class Assistant(Agent):
         )
         await publish_evidence(
             self._room,
-            build_chain_step(
-                "similar_creators",
-                f"{len(pool)} candidates recalled",
-                src=IDX_KOLS, res=True, latency_ms=ms,
-            ),
-        )
-        await publish_evidence(
-            self._room,
             build_evidence(
                 "similar_creators", step=4, index=IDX_KOLS, latency_ms=ms,
                 items=kol_items(pool, limit=8),
                 insight=f"Recalled {len(pool)} candidate creators.",
             ),
         )
+        if pool:
+            await publish_evidence(
+                self._room,
+                build_evidence(
+                    "kol_profile",
+                    step=4,
+                    index=IDX_KOLS,
+                    items=kol_items(pool[:1], limit=1),
+                    insight="Audience intelligence for the strongest matching archetype.",
+                    title="Audience Intelligence",
+                ),
+            )
+            self._turn_card_types.add("kol_profile")
         if not pool:
             return "No similar creators found for that brief."
         names = "; ".join(
@@ -548,7 +549,11 @@ class Assistant(Agent):
     async def search_playbook(
         self, context: RunContext, question: str, doc_type: str = ""
     ) -> str:
-        """Search the ANSIO methodology playbook (objections, strategy, cases).
+        """Ground objections, strategy, content angles, and ROI claims.
+
+        Use for objections like "Cursor is too big to compare to", methodology
+        questions like "how do we know it worked", content strategy questions,
+        and ROI/budget rationale before making a confident recommendation.
 
         Args:
             question: The question or objection to look up.
@@ -559,13 +564,6 @@ class Assistant(Agent):
         # $and/$eq/$gt/$lt (no $in), so scope to a single doc_type when given;
         # otherwise query semantically (methodology docs surface by meaning).
         filt = {"field": "doc_type", "condition": {"$eq": dt}} if dt in PLAYBOOK_DOC_TYPES else None
-        await publish_evidence(
-            self._room,
-            build_chain_step(
-                "playbook_hit",
-                f"Consulting the playbook — '{_short(question)}'",
-            ),
-        )
         try:
             result, ms = await self._q(IDX_CONTENT, question, top_k=3, filt=filt)
         except Exception:
@@ -578,24 +576,121 @@ class Assistant(Agent):
         ]
         await publish_evidence(
             self._room,
-            build_chain_step(
-                "playbook_hit",
-                f"{len(items)} methodology notes matched",
-                src=(items[0]["source"] if items else IDX_CONTENT),
-                res=True, latency_ms=ms,
-            ),
-        )
-        await publish_evidence(
-            self._room,
             build_evidence(
                 "playbook_hit", step="2b", index=IDX_CONTENT, latency_ms=ms,
                 items=items, insight=(items[0]["text"][:120] if items else ""),
                 source=(items[0]["source"] if items else ""),
             ),
         )
+        q_lower = (question or "").lower()
+        if any(k in q_lower for k in ("content", "angle", "hook", "post", "script", "内容", "脚本")):
+            await publish_evidence(
+                self._room,
+                build_evidence(
+                    "content_strategy",
+                    step=7,
+                    index=IDX_CONTENT,
+                    items=[
+                        {
+                            "title": "Workflow demo",
+                            "platform": "YouTube / X",
+                            "reason": "Show the tool solving a real coding task.",
+                            "source": items[0]["source"] if items else "playbook",
+                        },
+                        {
+                            "title": "Builder story",
+                            "platform": "X",
+                            "reason": "Frame the product through an indie builder's daily workflow.",
+                            "source": items[0]["source"] if items else "playbook",
+                        },
+                    ],
+                    insight="Recommended content angles for developer conversion.",
+                    title="Content Strategy",
+                ),
+            )
+            self._turn_card_types.add("content_strategy")
+        if any(k in q_lower for k in ("roi", "return", "forecast", "reach", "trial", "conversion", "预算", "转化")):
+            await publish_evidence(
+                self._room,
+                build_evidence(
+                    "roi_forecast",
+                    step=8,
+                    index=IDX_CONTENT,
+                    items=[
+                        {
+                            "title": "First test budget",
+                            "estimated_market_cost": 5000,
+                            "reason": "Keep the first round controlled before scaling.",
+                        },
+                        {
+                            "title": "Expected trial lift",
+                            "score": "conservative",
+                            "reason": "Depends on creator fit, content quality, and product activation.",
+                        },
+                    ],
+                    insight="Conservative ROI forecast for the first creator test.",
+                    title="ROI Forecast",
+                ),
+            )
+            self._turn_card_types.add("roi_forecast")
         if not rows:
             return "I don't have a playbook note on that."
         return rows[0]["text"][:400]
+
+    @function_tool()
+    async def publish_insight_card(
+        self,
+        context: RunContext,
+        card_type: str,
+        title: str,
+        insight: str,
+        items_json: str = "[]",
+    ) -> str:
+        """Publish one LLM-authored right-panel card for the demo chain.
+
+        Use after retrieval or reasoning when the right panel should advance the
+        eight-step story:
+        1 competitor_landscape = Competitor Landscape
+        2 content_hits = Campaign Timeline / Partnerships
+        3 similar_creators = Creator Discovery
+        4 kol_profile = Audience Intelligence
+        5 alpha_ranking = Creator Alpha Ranking
+        6 bundle = Campaign Bundle
+        7 content_strategy = Content Strategy
+        8 roi_forecast = ROI Forecast / Recommended Campaign
+
+        Only use facts from the conversation or tool results. ``items_json``
+        must be a JSON array of objects.
+
+        Args:
+            card_type: One of competitor_landscape, content_hits, playbook_hit,
+                kol_profile, similar_creators, alpha_ranking, bundle,
+                content_strategy, roi_forecast.
+            title: Short card title.
+            insight: One-sentence card subtitle or takeaway.
+            items_json: JSON array of item objects with fields like title, name,
+                handle, platform, followers, niche, score, alpha, reason,
+                estimated_market_cost, posts, total_views.
+        """
+        ct = (card_type or "").strip()
+        if ct not in EVIDENCE_TYPES:
+            ct = "content_hits"
+        if ct in self._turn_card_types:
+            return f"Skipped duplicate {ct} card for this turn."
+        items = _llm_card_items(items_json)
+        await publish_evidence(
+            self._room,
+            build_evidence(
+                ct,
+                step="LLM",
+                index="llm",
+                items=items,
+                insight=(insight or "")[:220],
+                title=(title or ct.replace("_", " ").title())[:80],
+            ),
+        )
+        self._turn_card_types.add(ct)
+        return f"Published {ct} card with {len(items)} items."
 
     # =====================================================================
     # META-TOOL (latency war-card core): ONE LLM decision -> deterministic
@@ -612,82 +707,37 @@ class Assistant(Agent):
         platform: str = "",
         budget: float | None = None,
     ) -> str:
-        """Run the full ANSIO recall chain and return scored recommendations.
+        """STEP 5 — Creator Alpha Ranking and recommendation.
 
-        Call this ONCE when you have enough of a brief to recommend creators. It
-        deterministically chains competitors -> sponsorship graph -> wide creator
-        recall -> Python Alpha scoring, all in-process, and returns the ranked
-        top creators with their fit/performance/value breakdown.
+        Call this once the founder asks for recommended creators, underpriced
+        alternatives, budget-backed picks, or "who would you choose". It runs
+        competitor context -> wide creator recall -> Python Alpha scoring, then
+        returns ranked creators with fit/performance/value breakdown.
 
         Args:
             product_desc: The user's product/brief.
             niche: Optional creator niche to bias recall.
             platform: Optional platform filter.
-            budget: Optional per-post budget cap (filters in Python, no re-query).
+            budget: Optional per-post budget cap. Pass this ONLY if the founder
+                explicitly stated a numeric cap; otherwise leave it empty.
         """
         platform_w = _wl_platform(platform)
         niche_w = _wl_niche(niche)
-        # Stage 0 — parse brief (intent only; deterministic, no Moss hop).
-        await publish_evidence(
-            self._room,
-            build_chain_step(
-                "alpha_ranking", f"Parsing the brief — '{_short(product_desc)}'",
-            ),
-        )
         t0 = time.perf_counter()
         try:
             # Deterministic chain (in-process, no per-hop LLM round-trip):
             #  1) competitor landscape (products, semantic)
             #  2) sponsorship graph signal (content, semantic context)
             #  4) wide creator recall (kols, the scoring pool) — top_k=80
-            with contextlib.suppress(Exception):
-                await publish_evidence(
-                    self._room,
-                    build_chain_step(
-                        "competitor_landscape", "Mapping your competitive space",
-                    ),
-                )
-                cres, comp_ms = await self._q(IDX_PRODUCTS, product_desc, top_k=5)
-                comp_items = [
-                    {"name": r["metadata"].get("name", "?"),
-                     "category": r["metadata"].get("category", ""),
-                     "funding": r["metadata"].get("funding", "")}
-                    for r in _md_list(cres)
-                ]
-                if comp_items:
-                    await publish_evidence(
-                        self._room,
-                        build_chain_step(
-                            "competitor_landscape",
-                            f"{len(comp_items)} competitors mapped",
-                            src=IDX_PRODUCTS, res=True, latency_ms=comp_ms,
-                        ),
-                    )
-                    await publish_evidence(
-                        self._room,
-                        build_evidence("competitor_landscape", step=1,
-                                       index=IDX_PRODUCTS, items=comp_items,
-                                       insight="Closest companies in your space."),
-                    )
-            # Stage 2 — sponsorship-graph signal folds into the wide recall.
-            await publish_evidence(
-                self._room,
-                build_chain_step(
-                    "similar_creators", "Reading the sponsorship graph",
-                ),
-            )
+            # Do not query/publish competitors here: this meta-tool is Step 5
+            # (Creator Alpha). Step 1 comes only from the explicit competitor-
+            # discovery route, otherwise the right rail jumps backward during
+            # recommendation turns (and the products query would be wasted).
             filt = _build_kol_filter(platform_w, niche_w)
-            kres, recall_ms = await self._q(
+            kres, _ = await self._q(
                 IDX_KOLS, product_desc, top_k=WIDE_POOL_TOP_K, filt=filt
             )
             pool = _md_list(kres)
-            await publish_evidence(
-                self._room,
-                build_chain_step(
-                    "similar_creators", f"{len(pool)} creators in the recall pool",
-                    src=IDX_KOLS, res=True, latency_ms=recall_ms,
-                ),
-            )
         except Exception:
             logger.exception("recommend_kols recall failed")
             return "I couldn't run the recommendation right now."
@@ -700,13 +750,6 @@ class Assistant(Agent):
         )
         chain_ms = (time.perf_counter() - t0) * 1000.0
 
-        # Stage 5 — scoring (pure Python, pool-relative Alpha).
-        await publish_evidence(
-            self._room,
-            build_chain_step(
-                "alpha_ranking", "Scanning for underpriced creators",
-            ),
-        )
         ranked = self._rerank(budget=budget)
         if not ranked:
             await publish_evidence(
@@ -719,20 +762,24 @@ class Assistant(Agent):
 
         await publish_evidence(
             self._room,
-            build_chain_step(
-                "alpha_ranking",
-                f"Top {min(len(ranked), 5)} ranked by Alpha — bundling",
-                src=IDX_KOLS, res=True, latency_ms=chain_ms,
-            ),
-        )
-        await publish_evidence(
-            self._room,
             build_evidence(
                 "alpha_ranking", step=5, index=IDX_KOLS, latency_ms=chain_ms,
                 items=kol_items(ranked, limit=5),
                 insight="Ranked by fit, performance and value (Alpha).",
             ),
         )
+        await publish_evidence(
+            self._room,
+            build_evidence(
+                "bundle",
+                step=6,
+                index=IDX_KOLS,
+                items=kol_items(ranked, limit=3),
+                insight="Two-creator test bundle with complementary developer reach.",
+                title="Campaign Bundle",
+            ),
+        )
+        self._turn_card_types.add("bundle")
         self._state.recommended = True
         return self._format_ranked(ranked)
 
@@ -775,16 +822,97 @@ _INSTRUCTIONS = textwrap.dedent(
     undervalued creators (KOLs) for influencer campaigns. You speak in voice.
     Follow the Language rule at the end of this prompt for which language to use.
 
+    # Turn policy: classify first, then decide whether to retrieve
+    Silently classify every founder turn before answering:
+    - pure smalltalk / thanks / greeting: no retrieval. Greet briefly and ask
+      for the campaign problem, target customer, or product category.
+    - greeting plus product/growth/audience facts: NOT smalltalk. Treat it as
+      the relevant business intent and retrieve immediately.
+    - qualification: no retrieval unless the founder already names a product,
+      audience, competitor, creator, budget, or growth goal. Ask at most one
+      sharp question.
+    - new growth brief: call `find_competitors` first, then answer with the
+      benchmark logic. Do not ask for more info if the product category and
+      growth goal are already present.
+    - competitor campaign question ("who did Cursor work with", "what worked"):
+      call `find_kols_who_promoted`.
+    - objection / proof / "Cursor is too big" / "how do we know it worked":
+      call `search_playbook` before making the strategic argument — but ONLY
+      after `find_competitors` has already fired; before that, curiosity or
+      doubt about competitors means run `find_competitors` first.
+    - creator discovery / "what kind of达人" / "find similar people":
+      call `find_similar_kols`.
+    - specific creator / handle / audience detail: call `get_kol_profile`.
+    - recommendation / "who would you pick" / underpriced creators:
+      call `recommend_kols` once, then reason from the ranked result. Do not
+      pass a budget unless the founder gave a numeric cap.
+    - budget range question with no stated cap: recommend a first-test range of
+      3000-5000 USD, then offer to refine. Do not pass a fake budget to tools.
+    - content angle question: call `search_playbook`, then publish a
+      `content_strategy` card with concrete angles.
+    - ROI / expected reach / conversion question: call `search_playbook`, then
+      publish a `roi_forecast` card with conservative ranges if supported by
+      playbook or current plan context.
+    - presentation step: when a right-rail card should advance the demo story,
+      call `publish_insight_card` with your chosen card_type and item content.
+
+    # Eight-step demo chain
+    Make the conversation naturally drive this right rail:
+    1 Competitor Landscape -> `competitor_landscape`
+    2 Campaign Timeline / Partnerships -> `content_hits`
+    3 Creator Discovery -> `similar_creators`
+    4 Audience Intelligence -> `kol_profile`
+    5 Creator Alpha Ranking -> `alpha_ranking`
+    6 Campaign Bundle -> `bundle`
+    7 Content Strategy -> `content_strategy`
+    8 ROI Forecast / Recommended Campaign -> `roi_forecast`
+    - Do not skip forward in the visible card chain. If the earlier evidence
+      step has not appeared in the conversation, ask or retrieve that step
+      before publishing a later card. In particular, show Campaign Timeline
+      before Creator Discovery, and Creator Alpha before Bundle/Content/ROI.
+    - Do not publish earlier-step cards after a later decision card; use spoken
+      summary instead.
+    - After Creator Discovery, publish Audience Intelligence (`kol_profile`) for
+      the strongest creator or archetype before moving to Creator Alpha.
+    - After Creator Alpha, publish Campaign Bundle (`bundle`) before moving to
+      Content Strategy or ROI.
+
+    # Flow discipline (HARD tool ordering — overrides turn-policy routing)
+    The four retrieval stages MUST first-fire in exactly this order:
+    `find_competitors` -> `find_kols_who_promoted` -> `find_similar_kols`
+    -> `recommend_kols`.
+    - The founder's FIRST growth brief (product + audience, even inside a
+      greeting) means: call `find_competitors` in that SAME turn. The story
+      cannot start without the competitor landscape.
+    - If a turn suggests a later stage but an earlier stage has NEVER fired in
+      this conversation, call the EARLIEST missing stage instead and narrate
+      that step (e.g. a reaction like "can we learn from them?" right after a
+      growth brief means: run `find_competitors` now if it has not run).
+    - "How do we pick / choose / find OUR creators?" means `find_similar_kols`,
+      NOT `recommend_kols`.
+    - Never call `recommend_kols` before the first three stages have fired —
+      unless the user explicitly demands the final list immediately.
+    - One stage per turn: make the stage's tool call, reveal, then let the
+      user react before the next stage.
+
     # How you work
-    - Understand the user's product, audience, platform, budget, and goal.
-    - Lead with insight, not interrogation: as soon as you can name a niche,
-      start retrieving — do not ask three questions before showing value.
-    - To recommend creators, call `recommend_kols` ONCE with the brief. It runs
-      the whole recall + scoring chain internally. Do not chain the five lookup
-      tools yourself for the main recommendation flow.
-    - Use `find_competitors`, `find_kols_who_promoted`, `get_kol_profile`,
-      `find_similar_kols`, and `search_playbook` for targeted follow-ups and
-      objections.
+    - Lead with insight, not interrogation: once you know the product category
+      and audience, retrieve and show value.
+    - Prefer one well-chosen retrieval tool per turn. Do not call every tool.
+    - After retrieval, answer in the founder's language and, when appropriate,
+      publish one polished right-rail card using `publish_insight_card`. Avoid
+      duplicate cards of the same type in the same turn unless the LLM card adds
+      a clearer decision layer.
+    - Use only tool results or conversation facts in cards. Never invent names,
+      handles, follower counts, prices, or ROI metrics.
+    - If the user asks to proceed at the end, summarize the selected creators,
+      budget, expected reach/trials/ROI, and publish an ROI Forecast card.
+    - For the AI coding tool demo, keep the narrative close to:
+      Cursor/Codeium benchmark -> creator partnerships -> similar creators ->
+      Creator Alpha -> two-creator bundle -> workflow/demo content -> ROI.
+    - If a turn asks both "who would you pick" and budget, call `recommend_kols`,
+      then publish a `bundle` card with the two selected creators, budget split,
+      and audience coverage before discussing content or ROI.
 
     # Re-retrieval rule (important)
     - If the user ADDS or CHANGES a platform, niche, audience, or budget
@@ -801,6 +929,8 @@ _INSTRUCTIONS = textwrap.dedent(
     # Output rules (voice)
     - Plain spoken text only: no JSON, markdown, lists, tables, code, or emojis.
     - One to three sentences per turn; name at most three creators at a time.
+    - If the user only greets you, start with a clear friendly greeting before
+      asking for their campaign or product details.
     - Spell numbers naturally ("three hundred thousand followers").
     - Read handles plainly, without the at-sign noise.
     - Only mention an ESTIMATED MARKET COST; never claim to know a creator's
@@ -811,14 +941,16 @@ _INSTRUCTIONS = textwrap.dedent(
 )
 
 
-# Retrieval is plain cloud Moss (no on-device embedding), so the worker stays
-# light. num_idle_processes=1 + a generous initialize timeout are kept as a
-# conservative default for stable cold starts on the demo machine.
+# num_idle_processes=1 + generous initialize timeout: conservative defaults for
+# stable cold starts on the demo machine (a heavier prewarm or CPU contention
+# must never starve sibling process imports past the spawn timeout).
 server = AgentServer(num_idle_processes=1, initialize_process_timeout=60.0)
 
 
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
+    # NOTE: the local KOL fallback index (moss_router) arms itself lazily on
+    # first cloud failure — no eager build here, so process warmup stays light.
 
 
 server.setup_fnc = prewarm
@@ -835,9 +967,8 @@ async def my_agent(ctx: JobContext):
         with contextlib.suppress(Exception):
             user_id = json.loads(ctx.job.metadata).get("user_id", DEFAULT_USER_ID)
 
-    # Consent-gated user-profile memory (memory.py). The frontend toggle rides
-    # in via dispatch metadata; console mode (no metadata) can opt in through
-    # ANSIO_MEMORY_ENABLED=1. Disabled => UserMemory makes ZERO Moss calls.
+    # Consent-gated user-profile memory + language mode (settings panel rides in
+    # via dispatch metadata; console mode opts in via ANSIO_MEMORY_ENABLED=1).
     memory_enabled = os.getenv("ANSIO_MEMORY_ENABLED", "0") == "1"
     refresh_profile = False
     language = normalize_language(os.getenv("ANSIO_LANGUAGE", "auto"))
@@ -861,12 +992,11 @@ async def my_agent(ctx: JobContext):
             language_boost=tts_language_boost(language),
             emotion="neutral",
             speed=1.0,
-            sample_rate=24000,
-            # PCM bypasses the framework mp3 decoder whose close-race kills
-            # speech mid-utterance (ValueError: I/O operation on closed file
-            # in codecs/decoder.py via _tts_inference_task — every session
-            # 09:37-10:10). Raw frames go straight to AudioEmitter.
-            audio_format="pcm",
+            # 16 kHz = one-third less audio data per second to synthesize/stream
+            # than 24 kHz, so MiniMax generation stays ahead of realtime playback
+            # and utterances FINISH instead of being flushed mid-sentence
+            # ("flush audio emitter due to slow audio generation").
+            sample_rate=16000,
         ),
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
@@ -887,10 +1017,6 @@ async def my_agent(ctx: JobContext):
                     model=ai_coustics.EnhancerModel.QUAIL_VF_S
                 ),
             ),
-            # Text-first bubbles: emit transcription as soon as the LLM
-            # produces it instead of pacing it with TTS audio playback
-            # (docs: agents/multimodality/text "Disabling synchronization").
-            text_output=room_io.TextOutputOptions(sync_transcription=False),
         ),
     )
 
