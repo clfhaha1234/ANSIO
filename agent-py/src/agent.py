@@ -49,7 +49,6 @@ from memory import (
     memory_greeting,
     profile_instructions,
 )
-from moss_router import MossRouter, prewarm_session
 from scoring import load_benchmark, score_and_rank
 from state import AnsioState
 
@@ -197,12 +196,12 @@ class Assistant(Agent):
         )
         self._room = room
         self._user_id = user_id
-        # KOL index routes to a local Moss session index (cloud ingest quota is
-        # exhausted and the cloud rebuild lock is stuck — see moss_router.py);
-        # content/products stay on the cloud client unchanged.
-        self._moss = MossRouter(
-            MossClient(os.getenv("MOSS_PROJECT_ID"), os.getenv("MOSS_PROJECT_KEY")),
-            IDX_KOLS,
+        # All three indexes are served from the cloud Moss project (ansio_kols
+        # rebuilt lean on a fresh-quota project — build_indexes --lean). A plain
+        # cloud client keeps each job process light: no on-device embedding, no
+        # 3GB local SessionIndex. moss_router.py stays as a zero-quota fallback.
+        self._moss = MossClient(
+            os.getenv("MOSS_PROJECT_ID"), os.getenv("MOSS_PROJECT_KEY")
         )
         self._indexes_loaded = False
         self._benchmark = load_benchmark()
@@ -812,20 +811,14 @@ _INSTRUCTIONS = textwrap.dedent(
 )
 
 
-# num_idle_processes=1: each job process builds its own local KOL index in a
-# background thread (moss_router) — more idle processes means parallel
-# CPU-heavy embeds that starved sibling imports past the initialize timeout
-# (observed live: children died in KeyboardInterrupt mid-import). The longer
-# timeout gives imports headroom while a build is running.
+# Retrieval is plain cloud Moss (no on-device embedding), so the worker stays
+# light. num_idle_processes=1 + a generous initialize timeout are kept as a
+# conservative default for stable cold starts on the demo machine.
 server = AgentServer(num_idle_processes=1, initialize_process_timeout=60.0)
 
 
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
-    # Pre-build the local KOL session index (~30s on-device embedding) during
-    # process warmup so the first live call never pays it (moss_router.py).
-    with contextlib.suppress(Exception):
-        prewarm_session(IDX_KOLS)
 
 
 server.setup_fnc = prewarm
@@ -869,6 +862,11 @@ async def my_agent(ctx: JobContext):
             emotion="neutral",
             speed=1.0,
             sample_rate=24000,
+            # PCM bypasses the framework mp3 decoder whose close-race kills
+            # speech mid-utterance (ValueError: I/O operation on closed file
+            # in codecs/decoder.py via _tts_inference_task — every session
+            # 09:37-10:10). Raw frames go straight to AudioEmitter.
+            audio_format="pcm",
         ),
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
